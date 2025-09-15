@@ -1,1 +1,365 @@
-Insert PID Code Here
+/*
+  Arduino Uno: 8.2 kHz PWM with 5 s open-loop, then PID closed-loop + live Serial tuning
+  - Output: D9 (Timer1, OC1A), ~8.2 kHz, 5 V logic
+  - Sensor: A0 (<= ~1.1 V when using INTERNAL reference)
+  - Behavior: Increase duty when measured voltage is below setpoint; decrease when above.
+  - Live tuning over Serial (115200): setpoint & PID gains.
+  - Duty window enforced (e.g., 30%..70%) with simple anti-windup.
+*/
+
+#include <Arduino.h>
+#include <ctype.h>
+#include <string.h>
+#include <stdlib.h>
+
+// =================== User-tunable defaults ===================
+static const float SETPOINT_MV_DEFAULT = 350.0f; // Initial target sensor voltage in millivolts
+float Kp = 0.001f;                               // Proportional gain (duty %-points per mV) ~ 0.002-0.05
+float Ki = 0.000f;                               // Integral gain (duty %-points per mV·s)   ~ 0-0.1
+float Kd = 0.000f;                               // Derivative gain (duty %-points per mV/s) ~ 0-0.0005
+
+// Control loop timing
+static const uint16_t CONTROL_PERIOD_MS = 10;    // 10 ms = 100 Hz loop
+
+// Open-loop duration (ms) on boot
+static const uint32_t OPEN_LOOP_MS = 5000;
+
+// ADC reference in millivolts (INTERNAL ~1.1 V)
+static const float AREF_MV = 1100.0f;
+
+// -------- Duty clamp window (EDIT THESE) --------
+static const float DUTY_MIN_PCT = 30.0f;         // lower bound for duty (%)
+static const float DUTY_MAX_PCT = 70.0f;         // upper bound for duty (%)
+// ============================================================
+
+// Serial debug + console
+static const bool ENABLE_DEBUG = true;
+static const uint32_t DEBUG_INTERVAL_MS = 200;
+
+// ---------- PWM configuration (Timer1 on pin 9 = OC1A) ----------
+// Fast PWM (ICR1 as TOP). Frequency ~ 16 MHz / (1 * (1951+1)) ≈ 8196.7 Hz (~8.2 kHz)
+static const uint16_t PWM_TOP = 1951;  // ICR1
+static const uint8_t  PWM_PIN = 9;     // OC1A
+
+// ---------- Globals ----------
+volatile float duty_pct = 50.0f;  // Start at 50% duty (open loop)
+float setpoint_mV = SETPOINT_MV_DEFAULT;
+
+uint32_t lastControlMs = 0;
+uint32_t lastDebugMs = 0;
+float integralTerm = 0.0f;
+float lastError = 0.0f;
+bool inClosedLoop = false;     // false=open loop, true=PID
+
+// Serial console line buffer
+static const uint8_t LINE_BUF_SZ = 96;
+char lineBuf[LINE_BUF_SZ];
+uint8_t lineLen = 0;
+
+// ---------- Helpers ----------
+static inline float clampf(float v, float lo, float hi) {
+  if (v < lo) return lo;
+  if (v > hi) return hi;
+  return v;
+}
+
+void setPWMDutyPct(float pct) {
+  // Enforce duty window here
+  pct = clampf(pct, DUTY_MIN_PCT, DUTY_MAX_PCT);
+  duty_pct = pct;
+
+  // In Fast PWM with ICR1=TOP (non-inverting), duty ≈ OCR1A/(ICR1+1)
+  uint32_t compare = (uint32_t)((PWM_TOP + 1) * (pct / 100.0f));
+  if (compare > PWM_TOP) compare = PWM_TOP;
+  OCR1A = (uint16_t)compare;
+}
+
+void setupTimer1Fixed8k2() {
+  pinMode(PWM_PIN, OUTPUT);
+
+  // Stop Timer1
+  TCCR1A = 0;
+  TCCR1B = 0;
+
+  // Fast PWM, TOP = ICR1 (WGM13:0 = 14 -> 1110b), non-inverting OC1A
+  TCCR1A = (1 << COM1A1) | (1 << WGM11);
+  TCCR1B = (1 << WGM13)  | (1 << WGM12);
+
+  ICR1 = PWM_TOP;      // TOP for fixed frequency
+  OCR1A = PWM_TOP/2;   // ~50% to start
+
+  // Prescaler = 1
+  TCCR1B |= (1 << CS10);
+}
+
+float readSensor_mV(uint8_t samples = 8) {
+  uint32_t acc = 0;
+  for (uint8_t i = 0; i < samples; i++) {
+    acc += (uint32_t)analogRead(A0);
+  }
+  float avgCounts = (float)acc / samples; // 0..1023
+  return (avgCounts * (AREF_MV / 1023.0f));
+}
+
+/*
+  pidStep with duty window and simple anti-windup:
+  - Compute P & D.
+  - Check if we're saturating in the same direction as the current error.
+    If so, freeze the integral this tick (prevents windup at the limits).
+  - Then update I (if allowed), recompute, and clamp duty to [DUTY_MIN_PCT..DUTY_MAX_PCT].
+*/
+void pidStep(float sp_mV, float meas_mV, float dt_s) {
+  float error = sp_mV - meas_mV;
+
+  // Derivative on error
+  float deriv = (dt_s > 0.0f) ? (error - lastError) / dt_s : 0.0f;
+
+  // Tentative control using current integral state
+  float u_noI = Kp * error + Kd * deriv + Ki * integralTerm;
+  float tentativeDuty = duty_pct + u_noI;
+
+  // Are we saturating in the same direction as the error?
+  bool saturatingHigh = (tentativeDuty >= DUTY_MAX_PCT) && (error > 0.0f);
+  bool saturatingLow  = (tentativeDuty <= DUTY_MIN_PCT) && (error < 0.0f);
+  bool freezeI = saturatingHigh || saturatingLow;
+
+  // Update integral only if not pushing further into saturation
+  if (!freezeI) {
+    integralTerm += error * dt_s;
+    // Integral clamp to keep it sane (unit: mV·s)
+    const float I_CLAMP = 1000.0f;
+    integralTerm = clampf(integralTerm, -I_CLAMP, I_CLAMP);
+  }
+
+  // Final output with (possibly) updated integral
+  float u = Kp * error + Kd * deriv + Ki * integralTerm;
+  float newDuty = clampf(duty_pct + u, DUTY_MIN_PCT, DUTY_MAX_PCT);
+
+  lastError = error;
+  setPWMDutyPct(newDuty);
+}
+
+// ----- Serial console utilities -----
+static inline void trimTrailing(char* s) {
+  int n = strlen(s);
+  while (n > 0 && (s[n-1] == '\r' || s[n-1] == '\n' || isspace((unsigned char)s[n-1]))) {
+    s[--n] = '\0';
+  }
+}
+
+static inline void toLowercase(char* s) {
+  for (char* p = s; *p; ++p) *p = (char)tolower((unsigned char)*p);
+}
+
+void printHelp() {
+  Serial.println(F("\nCommands (units in mV; gains in duty%%-points):"));
+  Serial.println(F("  help                    - show this help"));
+  Serial.println(F("  status                  - show setpoint, gains, duty, last reading"));
+  Serial.println(F("  set <mV>                - set target sensor voltage (e.g., set 220)"));
+  Serial.println(F("  kp <val>                - set Kp"));
+  Serial.println(F("  ki <val>                - set Ki"));
+  Serial.println(F("  kd <val>                - set Kd"));
+  Serial.println(F("  pid <kp> <ki> <kd>      - set all three gains"));
+  Serial.println(F("  mode open               - force open-loop (hold current duty)"));
+  Serial.println(F("  mode auto               - PID closed-loop control"));
+}
+
+void printStatus(float last_meas_mV) {
+  Serial.print(F("Mode: ")); Serial.println(inClosedLoop ? F("AUTO (PID)") : F("OPEN"));
+  Serial.print(F("Setpoint (mV): ")); Serial.println(setpoint_mV, 2);
+  Serial.print(F("Gains: Kp=")); Serial.print(Kp, 4);
+  Serial.print(F(", Ki=")); Serial.print(Ki, 4);
+  Serial.print(F(", Kd=")); Serial.println(Kd, 4);
+  Serial.print(F("Duty (%): ")); Serial.println(duty_pct, 2);
+  Serial.print(F("Duty window: ")); Serial.print(DUTY_MIN_PCT,1); Serial.print(F("% .. ")); Serial.print(DUTY_MAX_PCT,1); Serial.println('%');
+  Serial.print(F("Last V_meas (mV): ")); Serial.println(last_meas_mV, 2);
+  Serial.print(F("AREF (mV): ")); Serial.println(AREF_MV, 1);
+}
+
+bool parseFloatToken(char* tok, float& outVal) {
+  if (!tok) return false;
+  outVal = atof(tok);
+  return true; // atof returns 0.0 if invalid; we accept and rely on user sanity
+}
+
+void processCommand(char* line, float last_meas_mV) {
+  trimTrailing(line);
+  if (line[0] == '\0') return;
+
+  char* cmd = strtok(line, " \t");
+  if (!cmd) return;
+
+  char cmdLower[LINE_BUF_SZ];
+  strncpy(cmdLower, cmd, LINE_BUF_SZ - 1);
+  cmdLower[LINE_BUF_SZ - 1] = '\0';
+  toLowercase(cmdLower);
+
+  if (!strcmp(cmdLower, "help") || !strcmp(cmdLower, "?")) {
+    printHelp();
+    return;
+  }
+  if (!strcmp(cmdLower, "status") || !strcmp(cmdLower, "show")) {
+    printStatus(last_meas_mV);
+    return;
+  }
+  if (!strcmp(cmdLower, "set")) {
+    char* a = strtok(NULL, " \t");
+    float mv;
+    if (parseFloatToken(a, mv)) {
+      setpoint_mV = mv;
+      Serial.print(F("New setpoint: ")); Serial.print(setpoint_mV, 2); Serial.println(F(" mV"));
+    } else {
+      Serial.println(F("Usage: set <mV>  e.g., set 220"));
+    }
+    return;
+  }
+  if (!strcmp(cmdLower, "kp")) {
+    char* a = strtok(NULL, " \t");
+    float v;
+    if (parseFloatToken(a, v)) { Kp = v; Serial.print(F("Kp = ")); Serial.println(Kp, 4); }
+    else Serial.println(F("Usage: kp <val>"));
+    return;
+  }
+  if (!strcmp(cmdLower, "ki")) {
+    char* a = strtok(NULL, " \t");
+    float v;
+    if (parseFloatToken(a, v)) { Ki = v; Serial.print(F("Ki = ")); Serial.println(Ki, 4); }
+    else Serial.println(F("Usage: ki <val>"));
+    return;
+  }
+  if (!strcmp(cmdLower, "kd")) {
+    char* a = strtok(NULL, " \t");
+    float v;
+    if (parseFloatToken(a, v)) { Kd = v; Serial.print(F("Kd = ")); Serial.println(Kd, 4); }
+    else Serial.println(F("Usage: kd <val>"));
+    return;
+  }
+  if (!strcmp(cmdLower, "pid")) {
+    char* a = strtok(NULL, " \t");
+    char* b = strtok(NULL, " \t");
+    char* c = strtok(NULL, " \t");
+    float p,i,d;
+    if (parseFloatToken(a,p) && parseFloatToken(b,i) && parseFloatToken(c,d)) {
+      Kp = p; Ki = i; Kd = d;
+      Serial.print(F("PID set: Kp=")); Serial.print(Kp,4);
+      Serial.print(F(" Ki=")); Serial.print(Ki,4);
+      Serial.print(F(" Kd=")); Serial.println(Kd,4);
+    } else {
+      Serial.println(F("Usage: pid <kp> <ki> <kd>"));
+    }
+    return;
+  }
+  if (!strcmp(cmdLower, "mode")) {
+    char* a = strtok(NULL, " \t");
+    if (!a) {
+      Serial.println(F("Usage: mode <open|auto>"));
+      return;
+    }
+    toLowercase(a);
+    if (!strcmp(a, "open")) {
+      inClosedLoop = false;
+      Serial.println(F("Mode -> OPEN (holding current duty)"));
+    } else if (!strcmp(a, "auto") || !strcmp(a, "closed") || !strcmp(a, "pid")) {
+      integralTerm = 0.0f;
+      lastError = 0.0f;
+      inClosedLoop = true;
+      Serial.println(F("Mode -> AUTO (PID)"));
+    } else {
+      Serial.println(F("Usage: mode <open|auto>"));
+    }
+    return;
+  }
+
+  Serial.println(F("Unknown command. Type 'help'."));
+}
+
+void pollSerial(float last_meas_mV) {
+  while (Serial.available()) {
+    int ch = Serial.read();
+    if (ch == '\r') continue;           // ignore CR
+    if (ch == '\n') {                   // end of line
+      lineBuf[lineLen] = '\0';
+      processCommand(lineBuf, last_meas_mV);
+      lineLen = 0;
+    } else {
+      if (lineLen < (LINE_BUF_SZ - 1)) {
+        lineBuf[lineLen++] = (char)ch;
+      } else {
+        // overflow: reset
+        lineLen = 0;
+      }
+    }
+  }
+}
+
+// ---------- Setup ----------
+void setup() {
+  // ADC reference: INTERNAL (≈1.1 V) for sub-1 V sensors
+  analogReference(INTERNAL);
+  delay(5);
+  (void)analogRead(A0); // discard readings for reference settle
+  (void)analogRead(A0);
+
+  setupTimer1Fixed8k2();
+
+  // Start at 50%, but clamp to window (e.g., 30..70)
+  setPWMDutyPct(50.0f);
+
+  if (ENABLE_DEBUG) {
+    Serial.begin(115200);
+    delay(100);
+    Serial.println(F("\n[Uno 8.2 kHz PWM + PID + Live Console]"));
+    Serial.print(F("Initial setpoint (mV): ")); Serial.println(setpoint_mV, 2);
+    Serial.print(F("Initial duty (%): ")); Serial.println(duty_pct, 2);
+    Serial.print(F("Duty window: ")); Serial.print(DUTY_MIN_PCT,1); Serial.print(F("% .. ")); Serial.print(DUTY_MAX_PCT,1); Serial.println('%');
+    Serial.print(F("AREF (mV): ")); Serial.println(AREF_MV, 1);
+    Serial.println(F("Open loop for 5 seconds..."));
+    Serial.println(F("Type 'help' for commands."));
+  }
+
+  lastControlMs = millis();
+  lastDebugMs = millis();
+}
+
+// ---------- Main loop ----------
+void loop() {
+  static float last_meas_mV = 0.0f;
+  uint32_t now = millis();
+
+  // handover to closed loop after OPEN_LOOP_MS unless user forced open mode
+  if (!inClosedLoop && now >= OPEN_LOOP_MS) {
+    inClosedLoop = true;
+    if (ENABLE_DEBUG) Serial.println(F("Switching to closed loop (PID)."));
+    integralTerm = 0.0f;
+    lastError = 0.0f;
+  }
+
+  // Control loop tick
+  if (now - lastControlMs >= CONTROL_PERIOD_MS) {
+    float dt_s = (now - lastControlMs) / 1000.0f;
+    lastControlMs = now;
+
+    // Always read sensor so status/console shows fresh data
+    last_meas_mV = readSensor_mV(8);
+
+    if (inClosedLoop) {
+      pidStep(setpoint_mV, last_meas_mV, dt_s);
+    } else {
+      // open loop: hold current duty (still clamped by window)
+      setPWMDutyPct(duty_pct); // re-apply clamp in case window changed
+    }
+
+    // periodic debug
+    if (ENABLE_DEBUG && (now - lastDebugMs >= DEBUG_INTERVAL_MS)) {
+      lastDebugMs = now;
+      Serial.print(F("V_meas(mV)=")); Serial.print(last_meas_mV, 1);
+      Serial.print(F("  duty(%)="));  Serial.print(duty_pct, 2);
+      Serial.print(F("  set(mV)="));  Serial.print(setpoint_mV, 1);
+      Serial.print(F("  mode="));     Serial.println(inClosedLoop ? F("AUTO") : F("OPEN"));
+    }
+  }
+
+  // Non-blocking serial console
+  pollSerial(last_meas_mV);
+}
+
